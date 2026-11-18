@@ -6,8 +6,10 @@ import cors from "cors";
 import { connectToMongoDB } from "./config/db.js";
 import adminRoutes from "./routes/admin.routes.js";
 import authRoutes from "./routes/auth.routes.js";
+import bookingRoutes from "./routes/booking.routes.js";
 import serviceRoutes from "./routes/service.routes.js";
 import systemRoutes from "./routes/system.routes.js";
+import uploadRoutes from "./routes/upload.routes.js";
 import userRoutes from "./routes/user.routes.js";
 
 const app = express();
@@ -21,6 +23,8 @@ app.use(
 app.use(express.json());
 
 app.use(systemRoutes);
+app.use(uploadRoutes);
+app.use(bookingRoutes);
 app.use("/api/auth", authRoutes);
 app.use(userRoutes);
 app.use(serviceRoutes);

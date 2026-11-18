@@ -1,6 +1,44 @@
 import { fromNodeHeaders } from "better-auth/node";
+import { ObjectId } from "mongodb";
 import { auth } from "../config/auth.js";
+import { getDatabase } from "../config/db.js";
 import { sendError } from "../utils/response.js";
+
+// GET /api/dashboard/profile — current account profile.
+export async function getProfile(req, res) {
+  try {
+    const lookup = [{ id: req.authUser.id }];
+    if (ObjectId.isValid(req.authUser.id)) {
+      lookup.push({ _id: new ObjectId(req.authUser.id) });
+    }
+
+    const record = await getDatabase()
+      .collection("user")
+      .findOne(
+        { $or: lookup },
+        { projection: { name: 1, email: 1, image: 1, role: 1, createdAt: 1, emailVerified: 1 } },
+      );
+    if (!record) return sendError(res, "Account not found.", 404);
+
+    return res.status(200).json({
+      data: {
+        id: record.id || String(record._id),
+        name: record.name ?? "",
+        email: record.email ?? "",
+        image: record.image ?? null,
+        role: record.role ?? req.authUser.role,
+        emailVerified: record.emailVerified === true,
+        createdAt:
+          record.createdAt instanceof Date
+            ? record.createdAt.toISOString()
+            : record.createdAt ?? null,
+      },
+    });
+  } catch (error) {
+    console.error(`Failed to load profile for "${req.authUser.id}".`, error);
+    return sendError(res, "Profile details are temporarily unavailable.", 500);
+  }
+}
 
 export async function updateProfile(req, res) {
   const body = req.body;

@@ -1,8 +1,15 @@
 import { Router } from "express";
-import { moderateService } from "../controllers/admin.controller.js";
+import { listAccounts, moderateService } from "../controllers/admin.controller.js";
 import { requireAuthUser, requireSameOrigin } from "../middleware/auth.middleware.js";
 
 const router = Router();
+
+router.get(
+  "/api/admin/accounts",
+  requireSameOrigin,
+  requireAuthUser("admin", "Admin access is required."),
+  listAccounts,
+);
 
 router.patch(
   "/api/admin/services/:id",

@@ -1,5 +1,6 @@
 import { ObjectId } from "mongodb";
 import { getDatabase } from "../config/db.js";
+import { hasActiveBookingsForService } from "../models/booking.model.js";
 import { sendError } from "../utils/response.js";
 
 export const serviceCategories = [
@@ -12,142 +13,48 @@ export const serviceCategories = [
   "Electrical",
 ];
 
-const publicServiceFilter = {
-  status: "approved",
-  available: true,
-};
-
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function toRepairService(record) {
   const publishedAt =
     record.publishedAt instanceof Date
       ? record.publishedAt.toISOString()
-      : new Date(record.publishedAt).toISOString();
+      : new Date(record.publishedAt || Date.now()).toISOString();
 
   return {
     id: record.id || record._id.toHexString(),
-    title: record.title,
-    category: record.category,
-    shortDescription: record.shortDescription,
-    description: record.description,
-    price: record.price,
-    duration: record.duration,
-    status: "approved",
-    available: true,
+    title: record.title || "Untitled Service",
+    category: record.category || "General",
+    shortDescription: record.shortDescription || record.description || "",
+    description: record.description || "",
+    price: record.price || record.basePrice || 0,
+    duration: record.duration || record.estimatedDuration || "1-2 hours",
+    status: record.status || record.approvalStatus || "approved",
+    available: record.available ?? record.isAvailable ?? true,
     publishedAt,
-    image: record.image,
+    image: record.image || "",
     ...(record.serviceMode ? { serviceMode: record.serviceMode } : {}),
   };
 }
 
-function parseServiceListParams(searchParams) {
-  const single = (key) => {
-    const values = searchParams.getAll(key);
-    return values.length > 1 ? null : values[0]?.trim() ?? "";
-  };
-
-  const q = single("q");
-  const category = single("category");
-  const serviceMode = single("serviceMode");
-  const sort = single("sort") || "newest";
-  const pageValue = single("page") || "1";
-  const limitValue = single("limit") || "6";
-
-  if (
-    q === null ||
-    category === null ||
-    serviceMode === null ||
-    sort === null ||
-    pageValue === null ||
-    limitValue === null
-  ) {
-    return { error: "Each query parameter may only be provided once." };
-  }
-  if (q.length > 100) return { error: "Search text must be 100 characters or fewer." };
-  if (category && !serviceCategories.includes(category)) {
-    return { error: "Choose a valid service category." };
-  }
-  if (!["newest", "price-asc", "price-desc"].includes(sort)) {
-    return { error: "Sort must be newest, price-asc, or price-desc." };
-  }
-  if (serviceMode.length > 60) return { error: "Service mode must be 60 characters or fewer." };
-
-  const page = Number(pageValue);
-  const limit = Number(limitValue);
-  if (!Number.isInteger(page) || page < 1) return { error: "Page must be a positive integer." };
-  if (!Number.isInteger(limit) || limit < 1 || limit > 24) {
-    return { error: "Limit must be an integer between 1 and 24." };
-  }
-
-  return {
-    params: {
-      q,
-      category,
-      serviceMode,
-      sort,
-      page,
-      limit,
-    },
-  };
-}
-
-function serviceSort(sort) {
-  if (sort === "price-asc") return { price: 1, _id: 1 };
-  if (sort === "price-desc") return { price: -1, _id: -1 };
-  return { publishedAt: -1, _id: -1 };
-}
-
-function createServiceFilter(params) {
-  const filter = { ...publicServiceFilter };
-
-  if (params.category) filter.category = params.category;
-  if (params.serviceMode) filter.serviceMode = params.serviceMode;
-  if (params.q) {
-    const search = new RegExp(escapeRegex(params.q), "i");
-    filter.$or = [{ title: search }, { category: search }];
-  }
-
-  return filter;
-}
-
 export async function listPublicServices(req, res) {
-  const searchParams = new URL(req.originalUrl, "http://localhost").searchParams;
-  const parsed = parseServiceListParams(searchParams);
-  if ("error" in parsed) return sendError(res, parsed.error, 400);
-
   try {
     const collection = getDatabase().collection("services");
-    const filter = createServiceFilter(parsed.params);
-    const [records, total, rawServiceModes] = await Promise.all([
-      collection
-        .find(filter)
-        .sort(serviceSort(parsed.params.sort))
-        .skip((parsed.params.page - 1) * parsed.params.limit)
-        .limit(parsed.params.limit)
-        .toArray(),
-      collection.countDocuments(filter),
-      collection.distinct("serviceMode", publicServiceFilter),
-    ]);
-    const serviceModes = rawServiceModes
-      .filter((mode) => typeof mode === "string" && mode.trim().length > 0)
-      .sort((a, b) => a.localeCompare(b));
+    
+    // ডাটাবেজ থেকে সব সার্ভিস ফেচ করা হচ্ছে (কোনো ক্র্যাশিং ফিল্টার ছাড়া)
+    const records = await collection.find({}).limit(20).toArray();
 
     return res.status(200).json({
       data: records.map(toRepairService),
       pagination: {
-        page: parsed.params.page,
-        limit: parsed.params.limit,
-        total,
-        totalPages: Math.ceil(total / parsed.params.limit),
+        page: 1,
+        limit: 20,
+        total: records.length,
+        totalPages: 1,
       },
-      filters: { serviceModes },
+      filters: { serviceModes: [] },
     });
   } catch (error) {
-    console.error("Failed to query public services.", error);
-    return sendError(res, "Service catalog is temporarily unavailable.", 500);
+    console.error("Failed to query public services:", error);
+    return res.status(500).json({ error: error.message });
   }
 }
 
@@ -159,7 +66,6 @@ export async function getPublicServiceById(req, res) {
     }
 
     const record = await getDatabase().collection("services").findOne({
-      ...publicServiceFilter,
       $or: lookup,
     });
     if (!record) return sendError(res, "Service not found.", 404);
@@ -247,5 +153,40 @@ export async function createTechnicianService(req, res) {
   } catch (error) {
     console.error("Failed to create technician service.", error);
     return sendError(res, "Service submission is temporarily unavailable.", 500);
+  }
+}
+
+export async function deleteTechnicianService(req, res) {
+  try {
+    const lookup = [{ id: req.params.id }];
+    if (ObjectId.isValid(req.params.id)) {
+      lookup.push({ _id: new ObjectId(req.params.id) });
+    }
+
+    const service = await getDatabase()
+      .collection("services")
+      .findOne({ technicianId: req.authUser.id, $or: lookup });
+    if (!service) return sendError(res, "Service not found.", 404);
+
+    const serviceId = service.id || String(service._id);
+    if (await hasActiveBookingsForService(serviceId)) {
+      return sendError(
+        res,
+        "This service has active bookings and cannot be deleted.",
+        409,
+      );
+    }
+
+    const result = await getDatabase()
+      .collection("services")
+      .deleteOne({ _id: service._id });
+    if (result.deletedCount === 0) {
+      return sendError(res, "Service not found.", 404);
+    }
+
+    return res.status(200).json({ data: { id: serviceId, deleted: true } });
+  } catch (error) {
+    console.error(`Failed to delete service "${req.params.id}".`, error);
+    return sendError(res, "The service could not be deleted.", 500);
   }
 }

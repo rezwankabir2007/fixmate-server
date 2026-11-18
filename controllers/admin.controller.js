@@ -2,6 +2,35 @@ import { ObjectId } from "mongodb";
 import { getDatabase } from "../config/db.js";
 import { sendError } from "../utils/response.js";
 
+// GET /api/admin/accounts — read-only account directory.
+export async function listAccounts(req, res) {
+  try {
+    const records = await getDatabase()
+      .collection("user")
+      .find({}, { projection: { name: 1, email: 1, role: 1, createdAt: 1 } })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(200)
+      .toArray();
+
+    return res.status(200).json({
+      data: records.map((record) => ({
+        id: record.id || String(record._id),
+        name: record.name ?? "",
+        email: record.email ?? "",
+        role: record.role ?? "customer",
+        createdAt:
+          record.createdAt instanceof Date
+            ? record.createdAt.toISOString()
+            : record.createdAt ?? null,
+      })),
+      total: records.length,
+    });
+  } catch (error) {
+    console.error("Failed to list accounts.", error);
+    return sendError(res, "Account records could not be loaded.", 500);
+  }
+}
+
 export async function moderateService(req, res) {
   const body = req.body;
   if (typeof body !== "object" || body === null || Array.isArray(body) || !("status" in body)) {
