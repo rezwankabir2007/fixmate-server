@@ -15,25 +15,38 @@ function getStripe() {
   return new Stripe(secretKey);
 }
 
+function getStripeCurrency() {
+  const currency = (process.env.STRIPE_CURRENCY || "usd").toLowerCase();
+
+  if (currency !== "usd") {
+    throw new Error("Unsupported Stripe currency.");
+  }
+
+  return currency;
+}
+
 function isCustomerOwner(booking, user) {
   return (
-    (Boolean(user.email) && booking.customerEmail === user.email) ||
-    (Boolean(user.id) && booking.customerId === user.id)
+    (Boolean(user?.email) && booking.customerEmail === user.email) ||
+    (Boolean(user?.id) && booking.customerId === user.id)
   );
 }
 
 function getBookingLookup(booking) {
-  const lookup = [{ id: booking.id }];
+  const lookup = [];
 
-  if (ObjectId.isValid(booking.id)) {
-    lookup.push({ _id: new ObjectId(booking.id) });
+  if (booking.id) {
+    lookup.push({ id: String(booking.id) });
+  }
+
+  if (booking._id) {
+    lookup.push({ _id: booking._id });
   }
 
   return { $or: lookup };
 }
 
 // POST /api/payments/checkout
-// Create a secure Stripe Checkout Session for a completed booking.
 export async function createCheckoutSession(req, res) {
   const user = req.authUser;
   const bookingId = req.body?.bookingId;
@@ -42,24 +55,23 @@ export async function createCheckoutSession(req, res) {
     return sendError(res, "A valid booking ID is required.", 400);
   }
 
-  try {
-    const stripe = getStripe();
-    const booking = await findBookingById(bookingId.trim());
+  let paymentId = null;
 
-    if (!booking) {
-      return sendError(res, "Booking not found.", 404);
+  try {
+    if (!user?.id) {
+      return sendError(res, "Authenticated customer not found.", 401);
     }
 
-    if (!isCustomerOwner(booking, user)) {
+    const stripe = getStripe();
+    const currency = getStripeCurrency();
+    const booking = await findBookingById(bookingId.trim());
+
+    if (!booking || !isCustomerOwner(booking, user)) {
       return sendError(res, "Booking not found.", 404);
     }
 
     if (booking.status !== "completed") {
-      return sendError(
-        res,
-        "Only completed bookings can be paid.",
-        409,
-      );
+      return sendError(res, "Only completed bookings can be paid.", 409);
     }
 
     if (booking.paymentStatus === "paid") {
@@ -72,14 +84,13 @@ export async function createCheckoutSession(req, res) {
       return sendError(res, "The final booking amount is invalid.", 400);
     }
 
-    // Stripe USD amounts are sent in cents.
     const amountInCents = Math.round(amount * 100);
 
     if (Math.abs(amountInCents / 100 - amount) > 0.000001) {
       return sendError(
         res,
         "The booking amount cannot have more than two decimal places.",
-        400,
+        400
       );
     }
 
@@ -90,82 +101,103 @@ export async function createCheckoutSession(req, res) {
     }
 
     const payments = getDatabase().collection("payments");
+    const bookingKey = String(booking.id || booking._id);
 
-    // Reuse an existing open Checkout Session instead of creating
-    // another payment session for the same booking.
     const existingPayment = await payments.findOne({
-      bookingId: booking.id,
+      bookingId: bookingKey,
       status: "pending",
-      sessionId: { $exists: true },
+      sessionId: { $exists: true, $ne: null }
     });
 
     if (existingPayment?.sessionId) {
       const existingSession = await stripe.checkout.sessions.retrieve(
-        existingPayment.sessionId,
+        existingPayment.sessionId
       );
 
-      if (
-        existingSession.status === "open" &&
-        existingSession.url
-      ) {
+      if (existingSession.status === "open" && existingSession.url) {
+        const updatedSession = await stripe.checkout.sessions.update(
+          existingSession.id,
+          {
+            metadata: {
+              paymentId: String(existingPayment._id),
+              bookingId: bookingKey,
+              customerId: String(user.id)
+            }
+          }
+        );
+
         return res.status(200).json({
-          data: { checkoutUrl: existingSession.url },
+          data: { checkoutUrl: updatedSession.url }
         });
+      }
+
+      if (
+        existingSession.status === "complete" &&
+        existingSession.payment_status === "paid"
+      ) {
+        return sendError(
+          res,
+          "Your previous payment is being processed. Please wait.",
+          409
+        );
       }
 
       await payments.updateOne(
         { _id: existingPayment._id, status: "pending" },
-        { $set: { status: "expired", updatedAt: new Date() } },
+        {
+          $set: {
+            status: "expired",
+            updatedAt: new Date()
+          }
+        }
       );
     }
 
-    const paymentId = new ObjectId();
+    paymentId = new ObjectId();
     const now = new Date();
 
-    // Save the pending payment before creating the Stripe session.
     await payments.insertOne({
       _id: paymentId,
-      bookingId: booking.id,
-      customerId: user.id,
+      bookingId: bookingKey,
+      customerId: String(user.id),
       customerEmail: user.email,
       amount,
-      currency: "usd",
+      currency,
       status: "pending",
       sessionId: null,
       paymentIntentId: null,
       createdAt: now,
-      updatedAt: now,
+      updatedAt: now
     });
 
     try {
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
-        payment_method_types: ["card"],
         customer_email: user.email,
-        client_reference_id: booking.id,
+        client_reference_id: bookingKey,
         metadata: {
           paymentId: String(paymentId),
-          bookingId: booking.id,
-          customerId: user.id,
+          bookingId: bookingKey,
+          customerId: String(user.id)
         },
         line_items: [
           {
             quantity: 1,
             price_data: {
-              currency: "usd",
+              currency,
               unit_amount: amountInCents,
               product_data: {
                 name: booking.serviceTitle || "FixMate Repair Service",
-                description: `Booking ID: ${booking.id}`,
-              },
-            },
-          },
+                description: `Booking ID: ${bookingKey}`
+              }
+            }
+          }
         ],
         success_url:
           `${clientUrl}/dashboard/customer/bookings?payment=success` +
           `&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url:
-          `${clientUrl}/dashboard/customer/bookings?payment=cancelled`,
+          `${clientUrl}/dashboard/customer/bookings?payment=cancelled`
       });
 
       await payments.updateOne(
@@ -174,15 +206,13 @@ export async function createCheckoutSession(req, res) {
           $set: {
             sessionId: session.id,
             checkoutUrl: session.url,
-            updatedAt: new Date(),
-          },
-        },
+            updatedAt: new Date()
+          }
+        }
       );
 
       return res.status(201).json({
-        data: {
-          checkoutUrl: session.url,
-        },
+        data: { checkoutUrl: session.url }
       });
     } catch (error) {
       await payments.updateOne(
@@ -190,26 +220,25 @@ export async function createCheckoutSession(req, res) {
         {
           $set: {
             status: "failed",
-            updatedAt: new Date(),
-          },
-        },
+            updatedAt: new Date()
+          }
+        }
       );
 
       throw error;
     }
   } catch (error) {
-    console.error("Failed to create Stripe Checkout Session.", error);
+    console.error("Failed to create Stripe Checkout Session:", error);
+
     return sendError(
       res,
       "Online payment could not be started.",
-      500,
+      500
     );
   }
 }
 
 // POST /api/payments/webhook
-// Stripe calls this endpoint after payment events.
-// This endpoint must receive the raw request body.
 export async function handleStripeWebhook(req, res) {
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
   const signature = req.headers["stripe-signature"];
@@ -230,11 +259,13 @@ export async function handleStripeWebhook(req, res) {
     event = stripe.webhooks.constructEvent(
       req.body,
       signature,
-      webhookSecret,
+      webhookSecret
     );
+
+    console.log("Stripe webhook signature verified:", event.type);
   } catch (error) {
-    console.error("Stripe webhook signature verification failed.", error);
-    return res.status(400).send("Invalid Stripe webhook signature.");
+    console.error("Stripe webhook signature verification failed:", error);
+    return res.status(400).send("Invalid webhook signature.");
   }
 
   try {
@@ -249,33 +280,55 @@ export async function handleStripeWebhook(req, res) {
       }
 
       const paymentId = session.metadata?.paymentId;
-      const bookingId = session.metadata?.bookingId;
 
-      if (
-        !paymentId ||
-        !ObjectId.isValid(paymentId) ||
-        !bookingId
-      ) {
-        return res.status(400).send("Payment metadata is invalid.");
+      let payment = null;
+
+      if (paymentId && ObjectId.isValid(paymentId)) {
+        payment = await payments.findOne({
+          _id: new ObjectId(paymentId),
+          sessionId: session.id
+        });
       }
 
-      const payment = await payments.findOne({
-        _id: new ObjectId(paymentId),
-        bookingId,
-        sessionId: session.id,
-      });
+      if (!payment) {
+        payment = await payments.findOne({
+          sessionId: session.id
+        });
+      }
 
       if (!payment) {
+        console.error("Payment record not found:", session.id);
         return res.status(404).send("Payment record not found.");
       }
 
-      if (payment.status === "succeeded") {
-        return res.status(200).json({ received: true });
+      const bookingId = String(payment.bookingId || "");
+
+      if (!bookingId) {
+        return res.status(400).send("Booking ID is missing.");
+      }
+
+      if (
+        payment.status !== "pending" &&
+        payment.status !== "succeeded"
+      ) {
+        return res.status(409).send("Payment is not pending.");
+      }
+
+      const expectedAmount = Math.round(Number(payment.amount) * 100);
+
+      if (
+        !Number.isFinite(expectedAmount) ||
+        session.amount_total !== expectedAmount ||
+        session.currency !== payment.currency
+      ) {
+        console.error("Payment amount or currency mismatch.");
+        return res.status(400).send("Payment amount or currency mismatch.");
       }
 
       const booking = await findBookingById(bookingId);
 
       if (!booking) {
+        console.error("Booking not found:", bookingId);
         return res.status(404).send("Booking not found.");
       }
 
@@ -283,34 +336,34 @@ export async function handleStripeWebhook(req, res) {
         return res.status(409).send("Booking is not completed.");
       }
 
-      if (booking.paymentStatus !== "paid") {
-        const result = await bookings.updateOne(
-          {
-            ...getBookingLookup(booking),
-            status: "completed",
-            paymentStatus: "unpaid",
-          },
-          {
-            $set: {
-              paymentStatus: "paid",
-              paidAt: new Date(),
-              stripePaymentIntentId:
-                typeof session.payment_intent === "string"
-                  ? session.payment_intent
-                  : null,
-              updatedAt: new Date(),
-            },
-          },
-        );
+      const paymentIntentId =
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : null;
 
-        if (result.matchedCount === 0) {
-          const latestBooking = await findBookingById(bookingId);
-
-          if (latestBooking?.paymentStatus !== "paid") {
-            return res.status(409).send(
-              "Booking payment status could not be updated.",
-            );
+      const result = await bookings.updateOne(
+        {
+          ...getBookingLookup(booking),
+          status: "completed",
+          paymentStatus: { $ne: "paid" }
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+            paidAt: new Date(),
+            stripePaymentIntentId: paymentIntentId,
+            updatedAt: new Date()
           }
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        const latestBooking = await findBookingById(bookingId);
+
+        if (latestBooking?.paymentStatus !== "paid") {
+          return res.status(409).send(
+            "Booking payment status could not be updated."
+          );
         }
       }
 
@@ -319,15 +372,18 @@ export async function handleStripeWebhook(req, res) {
         {
           $set: {
             status: "succeeded",
-            paymentIntentId:
-              typeof session.payment_intent === "string"
-                ? session.payment_intent
-                : null,
-            paidAt: new Date(),
-            updatedAt: new Date(),
-          },
-        },
+            paymentIntentId,
+            paidAt: payment.paidAt || new Date(),
+            updatedAt: new Date()
+          }
+        }
       );
+
+      console.log("Payment successfully completed:", {
+        paymentId: String(payment._id),
+        bookingId,
+        sessionId: session.id
+      });
     }
 
     if (event.type === "checkout.session.expired") {
@@ -336,20 +392,22 @@ export async function handleStripeWebhook(req, res) {
       await payments.updateOne(
         {
           sessionId: session.id,
-          status: "pending",
+          status: "pending"
         },
         {
           $set: {
             status: "expired",
-            updatedAt: new Date(),
-          },
-        },
+            updatedAt: new Date()
+          }
+        }
       );
+
+      console.log("Checkout Session expired:", session.id);
     }
 
     return res.status(200).json({ received: true });
   } catch (error) {
-    console.error("Stripe webhook processing failed.", error);
+    console.error("Stripe webhook processing failed:", error);
     return res.status(500).send("Webhook processing failed.");
   }
 }
