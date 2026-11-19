@@ -11,14 +11,16 @@ import serviceRoutes from "./routes/service.routes.js";
 import systemRoutes from "./routes/system.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
 import userRoutes from "./routes/user.routes.js";
+import { ensureBookingIndexes } from "./models/booking.model.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(
-  cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-  })
+ cors({
+  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  credentials: true,
+})
 );
 app.use(express.json());
 
@@ -45,6 +47,14 @@ app.use((error, req, res, next) => {
 async function startServer() {
   try {
     await connectToMongoDB();
+
+    try {
+      await ensureBookingIndexes();
+    } catch (error) {
+      // Index creation must never block startup; queries still work without
+      // them, they only run slower at scale.
+      console.warn("Failed to ensure booking indexes:", error?.message ?? error);
+    }
 
     app.listen(PORT, () => {
       console.log(`FixMate server running on port ${PORT}`);

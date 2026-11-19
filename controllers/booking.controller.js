@@ -9,6 +9,7 @@ import {
   findBookingById,
   hasActiveBookingForService,
   isValidStatus,
+  normalizeStatus,
   serializeBooking,
   validateBookingInput,
 } from "../models/booking.model.js";
@@ -17,60 +18,142 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// POST /api/bookings — customer books an approved service.
+function identityFilter(user, field) {
+  // Ownership always comes from the verified token/session — never from the
+  // request body. The email matches the assignment contract; the stored id is
+  // accepted as an equivalent server-derived identifier.
+  const filter = [];
+  if (user.email) filter.push({ [field]: user.email });
+  if (user.id) {
+    filter.push({ [field === "customerEmail" ? "customerId" : "technicianId"]: user.id });
+  }
+  return filter.length > 0 ? filter : [{ [field]: "__no_identity__" }];
+}
+
+function isCustomerOwner(booking, user) {
+  return (
+    (Boolean(user.email) && booking.customerEmail === user.email) ||
+    (Boolean(user.id) && booking.customerId === user.id)
+  );
+}
+
+function isAssignedTechnician(booking, user) {
+  return (
+    (Boolean(user.email) && booking.technicianEmail === user.email) ||
+    (Boolean(user.id) && booking.technicianId === user.id)
+  );
+}
+
+function parseFinalAmount(value) {
+  if (typeof value === "string" && value.trim() !== "") {
+    value = Number(value);
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
+// POST /api/bookings — customer requests a repair for an approved service.
+//
+// Identity: name/email/role come from the verified token/session only.
+// Service + technician data are loaded from MongoDB and snapshotted into the
+// booking so later catalog edits never rewrite booking history.
 export async function createBooking(req, res) {
   const parsed = validateBookingInput(req.body);
   if ("error" in parsed) return sendError(res, parsed.error, 400);
-  const { serviceId, scheduledFor, address, notes } = parsed.value;
+  const { serviceId, customerPhone, address, preferredDate, problemDescription } =
+    parsed.value;
+
+  const user = req.authUser;
+  if (!user.email) {
+    return sendError(res, "Your account email is required to book a service.", 401);
+  }
 
   try {
     const service = await findBookableService(serviceId);
     if (!service) {
       return sendError(res, "Service not found or no longer available.", 404);
     }
-    if (!service.technicianId) {
-      return sendError(res, "This service cannot be booked right now.", 409);
-    }
 
     const resolvedServiceId = service.id || String(service._id);
+    const ownerFilter = identityFilter(user, "customerEmail");
     const alreadyActive = await hasActiveBookingForService(
       resolvedServiceId,
-      req.authUser.id,
+      ownerFilter,
     );
     if (alreadyActive) {
       return sendError(
         res,
-        "You already have an active booking for this service.",
+        "You already have an active request for this service.",
         409,
       );
     }
 
-    // Snapshot the technician's display name for list views.
-    const technicianLookup = [{ id: service.technicianId }];
-    if (ObjectId.isValid(service.technicianId)) {
-      technicianLookup.push({ _id: new ObjectId(service.technicianId) });
-    }
-    const technician = await getDatabase()
-      .collection("user")
-      .findOne({ $or: technicianLookup }, { projection: { name: 1 } });
+    // Resolve the assigned technician from the service record / user
+    // collection — the client never supplies technician identity.
+    let technicianEmail =
+      typeof service.technicianEmail === "string"
+        ? service.technicianEmail.trim()
+        : "";
+    let technicianName =
+      typeof service.technicianName === "string"
+        ? service.technicianName.trim()
+        : "";
 
-    const id = new ObjectId().toHexString();
+    const userCollection = getDatabase().collection("user");
+    if (!technicianEmail && service.technicianId) {
+      const lookup = [{ id: service.technicianId }];
+      if (ObjectId.isValid(service.technicianId)) {
+        lookup.push({ _id: new ObjectId(service.technicianId) });
+      }
+      const technician = await userCollection.findOne(
+        { $or: lookup },
+        { projection: { name: 1, email: 1 } },
+      );
+      technicianEmail = technician?.email ?? "";
+      technicianName = technicianName || technician?.name || "";
+    }
+
+    if (!technicianName && technicianEmail) {
+      const technician = await userCollection.findOne(
+        { email: technicianEmail },
+        { projection: { name: 1 } },
+      );
+      technicianName = technician?.name || "";
+    }
+
+    if (!technicianEmail) {
+      return sendError(res, "This service cannot be booked right now.", 409);
+    }
+
     const now = new Date();
     const booking = {
-      id,
+      _id: new ObjectId(),
       serviceId: resolvedServiceId,
       serviceTitle: service.title ?? "Service",
-      serviceCategory: service.category ?? null,
-      price: typeof service.price === "number" ? service.price : null,
-      technicianId: service.technicianId,
-      technicianName: technician?.name ?? "Technician",
-      customerId: req.authUser.id,
-      customerName: req.authUser.name ?? "",
-      customerEmail: req.authUser.email ?? "",
-      scheduledFor,
+      serviceImage: service.image ?? "",
+      category: service.category ?? null,
+      basePrice:
+        typeof service.basePrice === "number"
+          ? service.basePrice
+          : typeof service.price === "number"
+            ? service.price
+            : null,
+      technicianName: technicianName || "Technician",
+      technicianEmail,
+      customerId: user.id,
+      technicianId:
+        typeof service.technicianId === "string" ? service.technicianId : null,
+      customerName: user.name ?? "",
+      customerEmail: user.email,
+      customerPhone,
       address,
-      notes: notes || null,
-      status: "pending",
+      preferredDate,
+      problemDescription,
+      status: "requested",
+      finalAmount: null,
+      paymentStatus: "unpaid",
       createdAt: now,
       updatedAt: now,
     };
@@ -83,11 +166,11 @@ export async function createBooking(req, res) {
   }
 }
 
-// GET /api/bookings/mine — bookings the signed-in user created as a customer.
+// GET /api/bookings/mine — bookings the signed-in customer owns.
 export async function listMyBookings(req, res) {
   try {
     const records = await bookingsCollection()
-      .find({ customerId: req.authUser.id })
+      .find({ $or: identityFilter(req.authUser, "customerEmail") })
       .sort({ createdAt: -1, _id: -1 })
       .limit(100)
       .toArray();
@@ -99,11 +182,11 @@ export async function listMyBookings(req, res) {
   }
 }
 
-// GET /api/bookings/assigned — bookings on services owned by this technician.
+// GET /api/bookings/assigned — bookings assigned to this technician.
 export async function listAssignedBookings(req, res) {
   try {
     const records = await bookingsCollection()
-      .find({ technicianId: req.authUser.id })
+      .find({ $or: identityFilter(req.authUser, "technicianEmail") })
       .sort({ createdAt: -1, _id: -1 })
       .limit(100)
       .toArray();
@@ -156,7 +239,7 @@ export async function getBookingById(req, res) {
 
     const user = req.authUser;
     const isParticipant =
-      booking.customerId === user.id || booking.technicianId === user.id;
+      isCustomerOwner(booking, user) || isAssignedTechnician(booking, user);
     if (user.role !== "admin" && !isParticipant) {
       return sendError(res, "Booking not found.", 404);
     }
@@ -168,13 +251,31 @@ export async function getBookingById(req, res) {
   }
 }
 
-// PATCH /api/bookings/:id/status — customer cancels, technician accepts /
-// declines / completes. Admin may apply any valid status.
+// PATCH /api/bookings/:id/status — strict, server-enforced lifecycle:
+//
+//   requested -> accepted / rejected (assigned technician)
+//   requested -> cancelled          (booking owner)
+//   accepted  -> in-progress        (assigned technician)
+//   in-progress -> completed        (assigned technician, finalAmount > 0)
+//
+// paymentStatus is never accepted from the client; the only "paid" path is
+// the future verified payment flow. Invalid transitions and repeated actions
+// are rejected, and the update is conditional on the current status so
+// concurrent requests cannot double-apply a transition.
 export async function updateBookingStatus(req, res) {
   const body = req.body;
   if (!isRecord(body) || !("status" in body)) {
     return sendError(res, "A booking status is required.", 400);
   }
+
+  if ("paymentStatus" in body) {
+    return sendError(
+      res,
+      "Payment status cannot be changed from the client.",
+      400,
+    );
+  }
+
   const nextStatus = body.status;
   if (!isValidStatus(nextStatus)) {
     return sendError(
@@ -189,25 +290,54 @@ export async function updateBookingStatus(req, res) {
     if (!booking) return sendError(res, "Booking not found.", 404);
 
     const user = req.authUser;
-    const isCustomer = booking.customerId === user.id;
-    const isTechnician = booking.technicianId === user.id;
+    const rawStatus = booking.status;
+    const currentStatus = normalizeStatus(rawStatus);
 
-    if (user.role === "customer" && !isCustomer) {
-      return sendError(res, "Booking not found.", 404);
+    if (user.role === "admin") {
+      return sendError(
+        res,
+        "Administrators cannot change booking statuses.",
+        403,
+      );
     }
-    if (user.role === "technician" && !isTechnician) {
-      return sendError(res, "Booking not found.", 404);
-    }
-    if (user.role !== "admin" && user.role !== "customer" && user.role !== "technician") {
+    if (user.role === "customer") {
+      if (!isCustomerOwner(booking, user)) {
+        return sendError(res, "Booking not found.", 404);
+      }
+    } else if (user.role === "technician") {
+      if (!isAssignedTechnician(booking, user)) {
+        return sendError(res, "Booking not found.", 404);
+      }
+    } else {
       return sendError(res, "This action is not allowed for your account.", 403);
     }
 
-    if (!canTransition(booking.status, nextStatus, user.role)) {
+    if (!canTransition(currentStatus, nextStatus, user.role)) {
       return sendError(
         res,
-        `A ${booking.status} booking cannot be moved to ${nextStatus}.`,
+        `A ${currentStatus} booking cannot be moved to ${nextStatus}.`,
         409,
       );
+    }
+
+    const update = {
+      status: nextStatus,
+      updatedAt: new Date(),
+      statusUpdatedAt: new Date(),
+      statusUpdatedBy: user.id,
+    };
+
+    if (nextStatus === "completed") {
+      const finalAmount = parseFinalAmount(body.finalAmount);
+      if (finalAmount === null) {
+        return sendError(
+          res,
+          "A final amount greater than 0 is required to complete this booking.",
+          400,
+        );
+      }
+      update.finalAmount = finalAmount;
+      update.paymentStatus = "unpaid";
     }
 
     const lookup = [{ id: booking.id }];
@@ -215,23 +345,26 @@ export async function updateBookingStatus(req, res) {
       lookup.push({ _id: new ObjectId(booking.id) });
     }
 
+    // Conditional filter: only applies when the booking is still in the
+    // status we just validated, preventing race conditions and replays.
     const result = await bookingsCollection().updateOne(
-      { $or: lookup },
-      {
-        $set: {
-          status: nextStatus,
-          updatedAt: new Date(),
-          statusUpdatedAt: new Date(),
-          statusUpdatedBy: user.id,
-        },
-      },
+      { $or: lookup, status: rawStatus },
+      { $set: update },
     );
     if (result.matchedCount === 0) {
-      return sendError(res, "Booking not found.", 404);
+      return sendError(
+        res,
+        "The booking changed before the update could be applied. Refresh and try again.",
+        409,
+      );
     }
 
     return res.status(200).json({
-      data: { ...serializeBooking(booking), status: nextStatus },
+      data: serializeBooking({
+        ...booking,
+        ...update,
+        status: nextStatus,
+      }),
     });
   } catch (error) {
     console.error(`Failed to update booking "${req.params.id}".`, error);

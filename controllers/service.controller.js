@@ -32,6 +32,9 @@ function toRepairService(record) {
     publishedAt,
     image: record.image || "",
     ...(record.serviceMode ? { serviceMode: record.serviceMode } : {}),
+    ...(record.serviceArea ? { serviceArea: record.serviceArea } : {}),
+    ...(record.technicianName ? { technicianName: record.technicianName } : {}),
+    ...(record.technicianEmail ? { technicianEmail: record.technicianEmail } : {}),
   };
 }
 
@@ -58,6 +61,10 @@ export async function listPublicServices(req, res) {
   }
 }
 
+// Public detail endpoint: only approved and available services are exposed
+// (matching the documented publication contract in SERVICES_API.md). The
+// technician profile photo/bio are joined from the user collection when
+// available; nothing is hardcoded by the client.
 export async function getPublicServiceById(req, res) {
   try {
     const lookup = [{ id: req.params.id }];
@@ -67,9 +74,61 @@ export async function getPublicServiceById(req, res) {
 
     const record = await getDatabase().collection("services").findOne({
       $or: lookup,
+      $and: [
+        { $or: [{ status: "approved" }, { approvalStatus: "approved" }] },
+        { $or: [{ available: true }, { isAvailable: true }] },
+      ],
     });
     if (!record) return sendError(res, "Service not found.", 404);
-    return res.status(200).json({ data: toRepairService(record) });
+
+    const data = toRepairService(record);
+
+    const technicianId =
+      typeof record.technicianId === "string" ? record.technicianId : "";
+    const technicianEmail =
+      typeof record.technicianEmail === "string" ? record.technicianEmail : "";
+
+    if (technicianId || technicianEmail) {
+      const userLookup = [];
+      if (technicianId) {
+        userLookup.push({ id: technicianId });
+        if (ObjectId.isValid(technicianId)) {
+          userLookup.push({ _id: new ObjectId(technicianId) });
+        }
+      }
+      if (technicianEmail) {
+        userLookup.push({ email: technicianEmail });
+      }
+
+      const technician = await getDatabase()
+        .collection("user")
+        .findOne(
+          { $or: userLookup },
+          { projection: { name: 1, image: 1, bio: 1, area: 1, serviceArea: 1 } },
+        );
+
+      if (technician) {
+        if (!data.technicianName && technician.name) {
+          data.technicianName = technician.name;
+        }
+        if (technician.image) {
+          data.technicianImage = technician.image;
+        }
+        if (typeof technician.bio === "string" && technician.bio.trim()) {
+          data.technicianBio = technician.bio.trim();
+        }
+        const technicianArea =
+          (typeof technician.area === "string" && technician.area.trim()) ||
+          (typeof technician.serviceArea === "string" &&
+            technician.serviceArea.trim()) ||
+          "";
+        if (technicianArea) {
+          data.technicianArea = technicianArea;
+        }
+      }
+    }
+
+    return res.status(200).json({ data });
   } catch (error) {
     console.error(`Failed to load public service "${req.params.id}".`, error);
     return sendError(res, "Service details are temporarily unavailable.", 500);
@@ -145,6 +204,10 @@ export async function createTechnicianService(req, res) {
       image: imageUrl.toString(),
       ...(serviceMode ? { serviceMode } : {}),
       technicianId: req.authUser.id,
+      // Server-derived technician identity (never client-supplied) so the
+      // booking flow can snapshot the assigned technician reliably.
+      technicianName: req.authUser.name || "",
+      technicianEmail: req.authUser.email || "",
       status: "pending",
       available: false,
       publishedAt: new Date(),
