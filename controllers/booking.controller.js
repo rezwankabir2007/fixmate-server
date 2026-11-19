@@ -167,20 +167,27 @@ export async function createBooking(req, res) {
 }
 
 // GET /api/bookings/mine — bookings the signed-in customer owns.
+
 export async function listMyBookings(req, res) {
   try {
     const records = await bookingsCollection()
-      .find({ $or: identityFilter(req.authUser, "customerEmail") })
+      .find({
+        $or: identityFilter(req.authUser, "customerEmail"),
+        status: { $ne: "cancelled" },
+      })
       .sort({ createdAt: -1, _id: -1 })
       .limit(100)
       .toArray();
 
-    return res.status(200).json({ data: records.map(serializeBooking) });
+    return res.status(200).json({
+      data: records.map(serializeBooking),
+    });
   } catch (error) {
     console.error(`Failed to list bookings for "${req.authUser.id}".`, error);
     return sendError(res, "Your bookings could not be loaded.", 500);
   }
 }
+
 
 // GET /api/bookings/assigned — bookings assigned to this technician.
 export async function listAssignedBookings(req, res) {
