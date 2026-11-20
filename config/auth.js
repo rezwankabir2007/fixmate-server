@@ -2,10 +2,21 @@
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { jwt } from "better-auth/plugins";
+
 import { getDatabase, mongoClient } from "./db.js";
 
+const trustedOrigins = [
+  process.env.CLIENT_URL,
+  ...(process.env.NODE_ENV !== "production"
+    ? ["http://localhost:3000"]
+    : []),
+].filter(Boolean);
+
 export const auth = betterAuth({
-  baseURL: process.env.CLIENT_URL || "http://localhost:3000",
+  baseURL:
+    process.env.BETTER_AUTH_URL || "http://localhost:5000",
+
+  // Better Auth default basePath is /api/auth
   secret: process.env.BETTER_AUTH_SECRET,
 
   database: mongodbAdapter(getDatabase(), {
@@ -16,9 +27,7 @@ export const auth = betterAuth({
     trustedProxyHeaders: true,
   },
 
-  trustedOrigins: [
-    process.env.CLIENT_URL || "http://localhost:3000",
-  ],
+  trustedOrigins,
 
   user: {
     additionalFields: {
@@ -52,7 +61,7 @@ export const auth = betterAuth({
   session: {
     cookieCache: {
       enabled: true,
-      maxAge: 30 * 24 * 60 * 60, // 30 days
+      maxAge: 30 * 24 * 60 * 60,
     },
   },
 });

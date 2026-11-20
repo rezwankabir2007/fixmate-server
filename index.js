@@ -20,26 +20,77 @@ import { ensureBookingIndexes } from "./models/booking.model.js";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Allowed frontend origins
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
 // CORS configuration
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   }),
 );
 
-// IMPORTANT:
+// Initialize MongoDB and booking indexes once per server instance
+let databaseInitializationPromise;
+
+async function initializeDatabase() {
+  if (!databaseInitializationPromise) {
+    databaseInitializationPromise = (async () => {
+      await connectToMongoDB();
+
+      try {
+        await ensureBookingIndexes();
+      } catch (error) {
+        console.warn(
+          "Failed to ensure booking indexes:",
+          error?.message ?? error,
+        );
+      }
+    })().catch((error) => {
+      databaseInitializationPromise = undefined;
+      throw error;
+    });
+  }
+
+  return databaseInitializationPromise;
+}
+
+// Ensure database is ready before handling API requests
+app.use(async (req, res, next) => {
+  try {
+    await initializeDatabase();
+    next();
+  } catch (error) {
+    console.error("Database initialization failed:", error);
+
+    res.status(503).json({
+      success: false,
+      message: "Database is temporarily unavailable.",
+    });
+  }
+});
+
 // Stripe webhook must receive the original raw request body.
-// This must be registered BEFORE express.json().
+// Register this BEFORE express.json().
 app.use(
   "/api/payments/webhook",
   express.raw({ type: "application/json" }),
 );
 
-// Parse JSON for all other API requests.
+// Parse JSON for other API requests
 app.use(express.json());
 
-// Existing application routes
+// Application routes
 app.use(systemRoutes);
 app.use(uploadRoutes);
 app.use(bookingRoutes);
@@ -74,27 +125,13 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Start server
-async function startServer() {
-  try {
-    await connectToMongoDB();
-
-    try {
-      await ensureBookingIndexes();
-    } catch (error) {
-      console.warn(
-        "Failed to ensure booking indexes:",
-        error?.message ?? error,
-      );
-    }
-
-    app.listen(PORT, () => {
-      console.log(`FixMate server running on port ${PORT}`);
-    });
-  } catch (error) {
-    console.error("Failed to start server:", error);
-    process.exit(1);
-  }
+// Local development server
+// Vercel uses the exported Express app.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`FixMate server running on port ${PORT}`);
+  });
 }
 
-startServer();
+// Export Express app for Vercel
+export default app;

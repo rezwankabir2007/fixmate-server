@@ -8,10 +8,10 @@ import { sendError } from "../utils/response.js";
 
 const authBaseUrl =
   process.env.BETTER_AUTH_URL ||
-  process.env.CLIENT_URL ||
-  "http://localhost:3000";
+  "http://localhost:5000";
 
 const jwksUrl = new URL("/api/auth/jwks", authBaseUrl);
+
 const JWKS = createRemoteJWKSet(jwksUrl);
 
 async function verifyBearerJwt(authHeader) {
