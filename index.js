@@ -20,20 +20,37 @@ import { ensureBookingIndexes } from "./models/booking.model.js";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Normalize origins to avoid trailing-slash mismatches
+const normalizeOrigin = (value) => {
+  if (!value) return null;
+
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value.replace(/\/+$/, "");
+  }
+};
+
 // Allowed frontend origins
-const allowedOrigins = [
-  "http://localhost:3000",
-  process.env.CLIENT_URL,
-].filter(Boolean);
+const allowedOrigins = new Set(
+  [
+    "http://localhost:3000",
+    "https://fixmate-client-one.vercel.app",
+    process.env.CLIENT_URL,
+  ]
+    .map(normalizeOrigin)
+    .filter(Boolean),
+);
 
 // CORS configuration
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || allowedOrigins.has(normalizeOrigin(origin))) {
         return callback(null, true);
       }
 
+      console.error("Blocked CORS origin:", origin);
       return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
