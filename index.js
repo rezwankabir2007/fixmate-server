@@ -20,7 +20,7 @@ import { ensureBookingIndexes } from "./models/booking.model.js";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Normalize origins to avoid trailing-slash mismatches
+// Normalize origins to prevent trailing-slash mismatches
 const normalizeOrigin = (value) => {
   if (!value) return null;
 
@@ -31,30 +31,50 @@ const normalizeOrigin = (value) => {
   }
 };
 
-// Allowed frontend origins
+// Explicitly allowed frontend and backend origins
 const allowedOrigins = new Set(
   [
     "http://localhost:3000",
     "https://fixmate-client-one.vercel.app",
+    "https://fixmate-server-khaki.vercel.app",
     process.env.CLIENT_URL,
   ]
     .map(normalizeOrigin)
-    .filter(Boolean),
+    .filter(Boolean)
 );
 
 // CORS configuration
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.has(normalizeOrigin(origin))) {
+      // Allow requests without an Origin header
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      const normalizedOrigin = normalizeOrigin(origin);
+
+      // Allow explicitly configured origins
+      if (allowedOrigins.has(normalizedOrigin)) {
+        return callback(null, true);
+      }
+
+      // Allow this frontend project's Vercel preview deployments
+      const isAllowedVercelPreview =
+        /^https:\/\/fixmate-client-[a-z0-9-]+\.vercel\.app$/i.test(
+          normalizedOrigin || ""
+        );
+
+      if (isAllowedVercelPreview) {
         return callback(null, true);
       }
 
       console.error("Blocked CORS origin:", origin);
+
       return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
-  }),
+  })
 );
 
 // Initialize MongoDB and booking indexes once per server instance
@@ -70,7 +90,7 @@ async function initializeDatabase() {
       } catch (error) {
         console.warn(
           "Failed to ensure booking indexes:",
-          error?.message ?? error,
+          error?.message ?? error
         );
       }
     })().catch((error) => {
@@ -101,7 +121,7 @@ app.use(async (req, res, next) => {
 // Register this BEFORE express.json().
 app.use(
   "/api/payments/webhook",
-  express.raw({ type: "application/json" }),
+  express.raw({ type: "application/json" })
 );
 
 // Parse JSON for other API requests
