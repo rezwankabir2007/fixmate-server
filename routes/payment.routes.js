@@ -1,8 +1,8 @@
-
 import { Router } from "express";
 
 import {
   createCheckoutSession,
+  getCustomerPaymentHistory,
   handleStripeWebhook,
 } from "../controllers/payment.controller.js";
 
@@ -13,37 +13,22 @@ import {
 
 const router = Router();
 
-/**
- * Customer Stripe Checkout
- *
- * POST /api/payments/checkout
- *
- * - Only authenticated customers can create payments.
- * - Same-origin protection is applied.
- * - Booking ownership and payment amount are validated
- *   inside the payment controller.
- */
+// Customer creates a Stripe Checkout Session.
 router.post(
   "/api/payments/checkout",
   requireSameOrigin,
-  requireAuthUser(
-    "customer",
-    "Only customers can make payments."
-  ),
+  requireAuthUser("customer", "Only customers can make payments."),
   createCheckoutSession
 );
 
-/**
- * Stripe Webhook
- *
- * POST /api/payments/webhook
- *
- * - Stripe sends payment events to this endpoint.
- * - Customer authentication is not required.
- * - Stripe signature verification is handled
- *   inside handleStripeWebhook.
- * - Express raw body middleware must run before express.json().
- */
+// Customer views their own payment history.
+router.get(
+  "/api/payments/history",
+  requireAuthUser("customer", "Only customers can view payment history."),
+  getCustomerPaymentHistory
+);
+
+// Stripe webhook.
 router.post(
   "/api/payments/webhook",
   handleStripeWebhook
