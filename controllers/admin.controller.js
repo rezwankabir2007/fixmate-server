@@ -139,7 +139,6 @@ export async function updateAccountRole(req, res) {
     }
 
     const users = getDatabase().collection("user");
-
     const target = await users.findOne({ $or: lookup });
 
     if (!target) {
@@ -189,5 +188,170 @@ export async function updateAccountRole(req, res) {
   } catch (error) {
     console.error("Failed to update account role.", error);
     return sendError(res, "Account role could not be updated.", 500);
+  }
+}
+
+// GET /api/admin/transactions
+// Admin-only transaction list and revenue summary.
+export async function listAdminTransactions(req, res) {
+  try {
+    const database = getDatabase();
+    const paymentsCollection = database.collection("payments");
+    const bookingsCollection = database.collection("bookings");
+
+    const [payments, total, statusStats] = await Promise.all([
+      paymentsCollection
+        .find({})
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(200)
+        .toArray(),
+
+      paymentsCollection.countDocuments({}),
+
+      paymentsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$status",
+              count: { $sum: 1 },
+              revenue: {
+                $sum: {
+                  $cond: [
+                    { $eq: ["$status", "succeeded"] },
+                    { $ifNull: ["$amount", 0] },
+                    0,
+                  ],
+                },
+              },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    const bookingIds = [
+      ...new Set(
+        payments
+          .map((payment) => String(payment.bookingId || ""))
+          .filter(Boolean),
+      ),
+    ];
+
+    let bookings = [];
+
+    if (bookingIds.length > 0) {
+      const bookingLookup = [
+        { id: { $in: bookingIds } },
+      ];
+
+      const objectIds = bookingIds
+        .filter((id) => ObjectId.isValid(id))
+        .map((id) => new ObjectId(id));
+
+      if (objectIds.length > 0) {
+        bookingLookup.push({
+          _id: { $in: objectIds },
+        });
+      }
+
+      bookings = await bookingsCollection
+        .find({ $or: bookingLookup })
+        .toArray();
+    }
+
+    const bookingMap = new Map();
+
+    for (const booking of bookings) {
+      if (booking.id) {
+        bookingMap.set(String(booking.id), booking);
+      }
+
+      if (booking._id) {
+        bookingMap.set(String(booking._id), booking);
+      }
+    }
+
+    const transactions = payments.map((payment) => {
+      const bookingId = String(payment.bookingId || "");
+      const booking = bookingMap.get(bookingId);
+
+      return {
+        id: String(payment._id),
+        transactionId:
+          payment.paymentIntentId ||
+          payment.sessionId ||
+          String(payment._id),
+        bookingId,
+        bookingTitle: booking?.serviceTitle || "Unavailable booking",
+        customerName:
+          booking?.customerName ||
+          payment.customerEmail ||
+          "Unknown customer",
+        customerEmail:
+          payment.customerEmail ||
+          booking?.customerEmail ||
+          "",
+        technicianName: booking?.technicianName || "—",
+        amount: Number(payment.amount) || 0,
+        currency: String(payment.currency || "usd").toUpperCase(),
+        date:
+          payment.paidAt ||
+          payment.updatedAt ||
+          payment.createdAt
+            ? new Date(
+                payment.paidAt ||
+                payment.updatedAt ||
+                payment.createdAt,
+              ).toISOString()
+            : null,
+        status: payment.status || "unknown",
+      };
+    });
+
+    const summary = {
+      totalTransactions: total,
+      successfulTransactions: 0,
+      pendingTransactions: 0,
+      failedTransactions: 0,
+      expiredTransactions: 0,
+      totalRevenue: 0,
+      currency: "USD",
+    };
+
+    for (const stat of statusStats) {
+      if (stat._id === "succeeded") {
+        summary.successfulTransactions = stat.count;
+        summary.totalRevenue = Number(stat.revenue) || 0;
+      }
+
+      if (stat._id === "pending") {
+        summary.pendingTransactions = stat.count;
+      }
+
+      if (stat._id === "failed") {
+        summary.failedTransactions = stat.count;
+      }
+
+      if (stat._id === "expired") {
+        summary.expiredTransactions = stat.count;
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        transactions,
+        total,
+        summary,
+      },
+    });
+  } catch (error) {
+    console.error("Failed to load admin transactions:", error);
+
+    return sendError(
+      res,
+      "Transaction records could not be loaded.",
+      500,
+    );
   }
 }
